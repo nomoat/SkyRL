@@ -324,7 +324,8 @@ class MegatronWorker:
         provider.expert_model_parallel_size = megatron_config.expert_model_parallel_size
         provider.expert_tensor_parallel_size = megatron_config.expert_tensor_parallel_size
         provider.sequence_parallel = megatron_config.tensor_model_parallel_size > 1
-        provider.attention_backend = "flash" if flash_attn else "fused"
+        # TE's flash and fused kernels take only fp16/bf16; fp32 needs the unfused path.
+        provider.attention_backend = ("flash" if flash_attn else "fused") if bf16 else "unfused"
         provider.variable_seq_lengths = True
         provider.masked_softmax_fusion = True
         # Apply explicit MoE config fields to the provider. Overridable via

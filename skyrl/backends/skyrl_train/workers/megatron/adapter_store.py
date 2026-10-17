@@ -26,6 +26,21 @@ def iter_opts(opt) -> List[Any]:
     return [opt]
 
 
+def _main_param_groups(opt) -> List[List[torch.Tensor]]:
+    """The optimizer's main params per param group.
+
+    A bf16 param's main param is its fp32 copy (shard_fp32_from_float16_groups);
+    an fp32 param is its own main param (shard_fp32_groups). Both carry Adam state.
+    """
+    from_float16 = getattr(opt, "shard_fp32_from_float16_groups", None) or []
+    fp32 = getattr(opt, "shard_fp32_groups", None) or []
+    n = max(len(from_float16), len(fp32))
+    return [
+        list(from_float16[g] if g < len(from_float16) else []) + list(fp32[g] if g < len(fp32) else [])
+        for g in range(n)
+    ]
+
+
 def _iter_buffers(model_chunks) -> Iterable[Tuple[int, int, Any]]:
     """Yield (mc_idx, buf_idx, buffer) for every LoRA-trainable DDP buffer."""
     for mc_idx, mc in enumerate(model_chunks):
@@ -209,7 +224,7 @@ class AdapterStore:
         for _opt in iter_opts(optimizer):
             opt_main: List[List[torch.Tensor]] = []
             opt_state: List[List[dict]] = []
-            groups = getattr(_opt, "shard_fp32_from_float16_groups", None) or []
+            groups = _main_param_groups(_opt)
             for g, group in enumerate(groups):
                 main_g: List[torch.Tensor] = []
                 state_g: List[dict] = []
@@ -263,7 +278,7 @@ class AdapterStore:
             if _is_resident(buf.grad_data):
                 slot.cpu_grad_data[mc_idx][buf_idx].copy_(buf.grad_data, non_blocking=True)
         for opt_idx, _opt in enumerate(iter_opts(optimizer)):
-            groups = getattr(_opt, "shard_fp32_from_float16_groups", None) or []
+            groups = _main_param_groups(_opt)
             for g, group in enumerate(groups):
                 for i, main_param in enumerate(group):
                     slot.cpu_main_param[opt_idx][g][i].copy_(main_param, non_blocking=True)
@@ -294,7 +309,7 @@ class AdapterStore:
             if _is_resident(buf.grad_data):
                 buf.grad_data.copy_(slot.cpu_grad_data[mc_idx][buf_idx], non_blocking=True)
         for opt_idx, _opt in enumerate(iter_opts(optimizer)):
-            groups = getattr(_opt, "shard_fp32_from_float16_groups", None) or []
+            groups = _main_param_groups(_opt)
             for g, group in enumerate(groups):
                 for i, main_param in enumerate(group):
                     main_param.copy_(slot.cpu_main_param[opt_idx][g][i], non_blocking=True)
