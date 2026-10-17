@@ -362,8 +362,12 @@ class MegatronLoraAdapterSource(LoraAdapterWeightSource):
         self._base_model_name_or_path = base_model_name_or_path
 
     def export_adapter_stream(self) -> Iterator[Tuple[str, torch.Tensor]]:
-        for name, tensor in self._bridge.export_adapter_weights(self._actor_module, cpu=False, show_progress=False):
-            yield f"base_model.model.{name}", tensor
+        from skyrl.backends.skyrl_train.workers.megatron.multi_lora import expose_live_slot
+
+        # A multi-LoRA model exports its live slot (slot 0) as the single adapter.
+        with expose_live_slot(self._actor_module):
+            for name, tensor in self._bridge.export_adapter_weights(self._actor_module, cpu=False, show_progress=False):
+                yield f"base_model.model.{name}", tensor
 
     def finalize_adapter(
         self, adapter_state: Dict[str, torch.Tensor]

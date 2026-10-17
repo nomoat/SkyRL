@@ -448,10 +448,20 @@ class MegatronStrategy(DistributedStrategy):
 
         assert isinstance(model, nn.Module), "Model must be a nn.Module"
 
+        from skyrl.backends.skyrl_train.workers.megatron.multi_lora import (
+            canonical_adapter_name,
+            slot_of,
+        )
+
         model_state_dict = {}
         for name, param in model.named_parameters():
             if ".adapter" in name.lower():
-                model_state_dict[name] = param.data
+                # Multi-LoRA: save only the live slot, under the single-adapter name;
+                # scratch slots hold no tenant's state.
+                slot = slot_of(name)
+                if slot is not None and slot != 0:
+                    continue
+                model_state_dict[canonical_adapter_name(name)] = param.data
 
         with io.local_work_dir(ckpt_dir) as work_dir:
             adapter_path = self._get_rank_path(work_dir)
@@ -624,7 +634,11 @@ class MegatronStrategy(DistributedStrategy):
         with io.local_read_dir(ckpt_dir) as read_dir:
             adapter_path = self._get_rank_path(read_dir)
             state_dict = torch.load(adapter_path, map_location="cpu")
-            _, unexpected = model.load_state_dict(state_dict["model_state_dict"], strict=False)
+            adapters = state_dict["model_state_dict"]
+            # Checkpoints use single-adapter names; a multi-LoRA model loads them into slot 0.
+            if any(".adapters.0." in name for name, _ in model.named_parameters()):
+                adapters = {name.replace(".adapter.", ".adapters.0."): t for name, t in adapters.items()}
+            _, unexpected = model.load_state_dict(adapters, strict=False)
             if len(unexpected) > 0:
                 raise ValueError(f"Unexpected keys in LoRA adapter state dict: {unexpected}")
             self.print(f"Loaded {len(state_dict['model_state_dict'])} LoRA adapters from {adapter_path}.")

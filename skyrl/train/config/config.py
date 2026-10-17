@@ -429,6 +429,16 @@ class MegatronHFExportConfig(BaseConfig):
 
 @dataclass
 class MegatronLoraConfig(BaseConfig):
+    multi_lora_slots: int = 0
+    """Batched multi-tenant LoRA: build LoRA layers with this many adapter slots
+    (Megatron-Bridge ``MultiLoRA``) so several tenants' adapters run in one
+    forward/backward. Slot 0 holds the live (optimized) adapter; the others are
+    scratch for batched passes. ``0`` keeps the single-adapter LoRA layers.
+    Requires ``lora_type="lora"``, ``merge_lora=False`` and no MoE adapter options."""
+    deterministic_init_seed: Optional[int] = None
+    """When set, initialize the live LoRA weights from this seed and each
+    parameter's name instead of the global RNG stream, so single-adapter and
+    multi-LoRA builds start from identical weights (used to compare them)."""
     lora_type: str = "lora"
     """``"lora"`` or ``"canonical_lora"``.
     See https://docs.nvidia.com/nemo/megatron-bridge/0.2.0/apidocs/bridge/bridge.peft.lora.html"""

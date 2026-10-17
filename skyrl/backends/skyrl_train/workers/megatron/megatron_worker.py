@@ -16,6 +16,7 @@ from megatron.bridge.peft.canonical_lora import CanonicalLoRA
 from megatron.bridge.peft.lora import LoRA
 from megatron.core.optimizer import ChainedOptimizer, DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.core.utils import unwrap_model
 from omegaconf import OmegaConf
 from transformers import AutoConfig
 
@@ -90,6 +91,7 @@ from skyrl.backends.skyrl_train.weight_sync import (
 from skyrl.backends.skyrl_train.weight_sync.fp8 import (
     resolve_serialized_fp8_config,
 )
+from skyrl.backends.skyrl_train.workers.megatron import multi_lora
 from skyrl.backends.skyrl_train.workers.megatron.adapter_store import (
     AdapterStore,
     LoraSignature,
@@ -483,7 +485,25 @@ class MegatronWorker:
         else:
             target_modules = lora_config.target_modules
 
-        if lora_type == "lora":
+        multi_lora_slots = self.cfg.policy.megatron_config.lora_config.multi_lora_slots
+        if multi_lora_slots > 0:
+            # Batched multi-tenant LoRA (see workers/megatron/multi_lora.py): slot 0
+            # is the live adapter, slots 1..n-1 are scratch for batched passes.
+            from megatron.bridge.peft.multi_lora import MultiLoRA
+
+            if lora_type != "lora" or experts_shared_outer_loras or normalize_moe_lora:
+                raise ValueError("multi_lora_slots requires lora_type='lora' without MoE adapter options")
+            self.lora_cls = MultiLoRA(
+                target_modules=target_modules,
+                n_adapters=multi_lora_slots,
+                dim=lora_config.rank,
+                alpha=lora_config.alpha,
+                dropout=lora_config.dropout,
+                lora_A_init_method=lora_config.init_method,
+                lora_B_init_method="zero",
+                exclude_modules=[] if lora_config.exclude_modules is None else lora_config.exclude_modules,
+            )
+        elif lora_type == "lora":
             self.lora_cls = LoRA(
                 target_modules=target_modules,
                 dim=lora_config.rank,
@@ -562,9 +582,18 @@ class MegatronWorker:
         if lora_config is not None:
             self.configure_lora(lora_config, lora_type, experts_shared_outer_loras=experts_shared_outer_loras)
 
+            megatron_lora = self.cfg.policy.megatron_config.lora_config
+
             def lora_pre_wrap_hook(model):
                 lora_model = self.lora_cls(model, training=True)
+                if megatron_lora.multi_lora_slots > 0:
+                    # Before set_params_to_save and DDP: only slot 0 is trainable.
+                    multi_lora.prepare_slots(lora_model, lora_config.rank, float(lora_config.alpha))
                 self.lora_cls.set_params_to_save(lora_model)
+                if megatron_lora.deterministic_init_seed is not None:
+                    multi_lora.deterministic_lora_init(
+                        lora_model, megatron_lora.deterministic_init_seed, lora_config.init_method
+                    )
 
                 return lora_model
 
@@ -579,6 +608,8 @@ class MegatronWorker:
         model = self.provider.provide_distributed_model(
             ddp_config=default_ddp_config, wrap_with_ddp=wrap_with_ddp, bf16=bf16
         )
+        if lora_config is not None and self.cfg.policy.megatron_config.lora_config.multi_lora_slots > 0:
+            multi_lora.install_default_routing([unwrap_model(chunk) for chunk in model])
         return model
 
     def _forward_logprobs(self, data: TrainingInputBatch) -> torch.Tensor:
@@ -1641,7 +1672,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # expert-agnostic name; collect repeats in emission order (expert 0..E-1)
         # and stack them back into the (E, out, in) layout the converter expects.
         adapter_tensor_lists: Dict[str, List[torch.Tensor]] = {}
-        for name, tensor in self.bridge.export_adapter_weights(self.actor_module, cpu=keep_state, show_progress=False):
+        with multi_lora.expose_live_slot(self.actor_module):
+            exported = list(self.bridge.export_adapter_weights(self.actor_module, cpu=keep_state, show_progress=False))
+        for name, tensor in exported:
             if keep_state:
                 # Keep the training dtype (bf16): upcasting to float32 doubles
                 # the already-large per-expert adapter state (and the file the
