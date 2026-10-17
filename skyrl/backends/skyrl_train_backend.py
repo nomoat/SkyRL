@@ -50,6 +50,22 @@ from skyrl.utils.tok import get_tokenizer
 LOSS_METRICS_PREFIX = "loss_metrics/"
 
 
+# Per-sample fields of a PreparedModelPassBatch.
+_MODEL_PASS_FIELDS = (
+    "all_model_inputs",
+    "all_targets",
+    "all_token_weights",
+    "all_sampling_logprobs",
+    "all_advantages",
+    "all_values",
+    "all_returns",
+    "all_rollout_logprobs",
+    "all_model_ids",
+    "all_loss_fns",
+    "all_loss_fn_configs",
+)
+
+
 class SkyRLTrainBackendOverrides(BaseModel, extra="allow"):
     """Configuration overrides for the SkyRL-Train backend.
 
@@ -229,19 +245,7 @@ class SkyRLTrainBackend(AbstractBackend):
         if len(unique_model_ids) <= 1:
             return [prepared_batch]
 
-        batch_fields = (
-            "all_model_inputs",
-            "all_targets",
-            "all_token_weights",
-            "all_sampling_logprobs",
-            "all_advantages",
-            "all_values",
-            "all_returns",
-            "all_rollout_logprobs",
-            "all_model_ids",
-            "all_loss_fns",
-            "all_loss_fn_configs",
-        )
+        batch_fields = _MODEL_PASS_FIELDS
 
         request_slices_by_model_id: dict[str, list[tuple[str, str, int, int]]] = {}
         for request_id, model_id, start_idx, end_idx in prepared_batch.request_batch_slices:
@@ -269,6 +273,49 @@ class SkyRLTrainBackend(AbstractBackend):
             )
 
         return sub_batches
+
+    @property
+    def _batched_lora_slots(self) -> int:
+        """Adapter slots per batched pass (0 or 1: one tenant per pass)."""
+        if self._cfg is None or not self._adapter_only_sync:
+            return 0
+        return self._cfg.trainer.policy.megatron_config.lora_config.multi_lora_slots
+
+    def _batched_lora_groups(
+        self, prepared_batch: types.PreparedModelPassBatch, by_loss: bool
+    ) -> list[tuple[types.PreparedModelPassBatch, list[str] | None, list[int] | None]]:
+        """Split a batch into passes of up to ``_batched_lora_slots`` tenants each.
+
+        A worker pass computes one loss function, so with ``by_loss`` tenants are
+        grouped by (loss_fn, loss_fn_config) first. Within a pass, rows are
+        ordered by tenant (each tenant's requests keep their order) and tagged
+        with the tenant's slot, as the multi-LoRA layers require contiguous
+        per-slot rows. Single-tenant passes return (batch, None, None).
+        """
+        groups: dict = {}
+        for sub in self._split_model_pass_batch_by_model_id(prepared_batch):
+            config = next((c for c in sub.all_loss_fn_configs if c is not None), None)
+            key = (sub.all_loss_fns[0], repr(sorted(config.items())) if config else None) if by_loss else None
+            groups.setdefault(key, []).append(sub)
+        passes = []
+        n = max(1, self._batched_lora_slots)
+        for subs in groups.values():
+            for i in range(0, len(subs), n):
+                chunk = subs[i : i + n]
+                if len(chunk) == 1:
+                    passes.append((chunk[0], None, None))
+                    continue
+                data = {field: [] for field in _MODEL_PASS_FIELDS}
+                slices, slots, tenants = [], [], []
+                for slot, sub in enumerate(chunk):
+                    tenants.append(sub.all_model_ids[0])
+                    offset = len(data["all_model_inputs"])
+                    for field in _MODEL_PASS_FIELDS:
+                        data[field].extend(getattr(sub, field))
+                    slices.extend((rid, mid, a + offset, b + offset) for rid, mid, a, b in sub.request_batch_slices)
+                    slots.extend([slot] * len(sub.all_model_inputs))
+                passes.append((types.PreparedModelPassBatch(request_batch_slices=slices, **data), tenants, slots))
+        return passes
 
     def _build_policy(self, PolicyWorker, model_id: str):
         cfg = self._cfg
@@ -1060,6 +1107,10 @@ class SkyRLTrainBackend(AbstractBackend):
 
         self._sleep_inference_engines()
         results = {}
+        if self._batched_lora_slots > 1:
+            for sub_batch, tenants, slots in self._batched_lora_groups(prepared_batch, by_loss=True):
+                results.update(self._forward_backward_single_model_batch(sub_batch, tenants, slots))
+            return results
         for sub_batch in self._split_model_pass_batch_by_model_id(prepared_batch):
             results.update(self._forward_backward_single_model_batch(sub_batch))
         return results
@@ -1067,8 +1118,11 @@ class SkyRLTrainBackend(AbstractBackend):
     def _forward_backward_single_model_batch(
         self,
         prepared_batch: types.PreparedModelPassBatch,
+        tenants: list[str] | None = None,
+        slots: list[int] | None = None,
     ) -> dict[str, types.ForwardBackwardOutput | types.ErrorResponse]:
-        role = self._get_batch_role(prepared_batch.all_model_ids)
+        """One worker pass. ``tenants``/``slots``: a batched multi-LoRA pass (see _batched_lora_groups)."""
+        role = self._batched_role(tenants) if tenants else self._get_batch_role(prepared_batch.all_model_ids)
         loss_fn = prepared_batch.all_loss_fns[0]
         self._validate_batch_role_and_loss(role, loss_fn)
         if role == "critic" and any(
@@ -1079,6 +1133,8 @@ class SkyRLTrainBackend(AbstractBackend):
         ):
             raise ValueError("Critic forward_backward requires values and returns for every response token")
         batch = self._to_training_batch(prepared_batch, role)
+        if tenants:
+            batch["lora_slot"] = torch.tensor(slots, dtype=torch.long)
         micro_bs = (
             self._cfg.trainer.micro_train_batch_size_per_gpu if self._cfg.trainer.strategy == "megatron" else None
         )
@@ -1095,7 +1151,9 @@ class SkyRLTrainBackend(AbstractBackend):
         loss_fn, loss_fn_config = self._normalize_policy_loss_request(role, loss_fn, loss_fn_config)
         # Single model_id per sub-batch (split upstream); pass it so the
         # dispatch layer can swap to the right LoRA adapter before the op.
+        # A batched pass makes its first tenant live; the worker lends the rest scratch slots.
         model_id = prepared_batch.all_model_ids[0] if prepared_batch.all_model_ids else None
+        batched_kwargs = {"lora_tenants": tenants} if tenants else {}
         if role == "critic":
             self._dispatch.set_algorithm_config(
                 "critic",
@@ -1109,6 +1167,7 @@ class SkyRLTrainBackend(AbstractBackend):
                 loss_fn=loss_fn,
                 loss_fn_config=loss_fn_config,
                 model_id=model_id,
+                **batched_kwargs,
             )
 
         # Trim padding entries from loss_fn_outputs
@@ -1136,12 +1195,28 @@ class SkyRLTrainBackend(AbstractBackend):
                     loss_fn_outputs.append(formatted_output)
             else:
                 loss_fn_outputs = [{} for _ in range(end_idx - start_idx)]
+            request_metrics = metrics
+            if tenants:
+                # The worker's metrics cover every tenant in the pass. Loss sums are
+                # recomputed per request from its own rows; other metrics stay pass-wide.
+                request_metrics = dict(metrics)
+                if all("elementwise_loss" in o for o in loss_fn_outputs):
+                    own = float(sum(sum(o["elementwise_loss"]["data"]) for o in loss_fn_outputs))
+                    for key in ("total_loss:sum", "loss:sum"):
+                        if key in request_metrics:
+                            request_metrics[key] = own
             results[request_id] = types.ForwardBackwardOutput(
                 loss_fn_output_type=data.loss_fn_output_type,
                 loss_fn_outputs=loss_fn_outputs,
-                metrics=metrics,
+                metrics=request_metrics,
             )
         return results
+
+    def _batched_role(self, tenants: list[str]) -> str:
+        roles = {self._get_role(model_id) for model_id in tenants}
+        if roles != {"policy"}:
+            raise ValueError(f"batched multi-LoRA passes are for policy models, got roles {sorted(roles)}")
+        return "policy"
 
     def forward(
         self,
@@ -1154,6 +1229,10 @@ class SkyRLTrainBackend(AbstractBackend):
 
         self._sleep_inference_engines()
         results = {}
+        if self._batched_lora_slots > 1:
+            for sub_batch, tenants, slots in self._batched_lora_groups(prepared_batch, by_loss=False):
+                results.update(self._forward_single_model_batch(sub_batch, tenants, slots))
+            return results
         for sub_batch in self._split_model_pass_batch_by_model_id(prepared_batch):
             results.update(self._forward_single_model_batch(sub_batch))
         return results
@@ -1161,15 +1240,20 @@ class SkyRLTrainBackend(AbstractBackend):
     def _forward_single_model_batch(
         self,
         prepared_batch: types.PreparedModelPassBatch,
+        tenants: list[str] | None = None,
+        slots: list[int] | None = None,
     ) -> dict[str, types.ForwardBackwardOutput | types.ErrorResponse]:
-        role = self._get_batch_role(prepared_batch.all_model_ids)
+        role = self._batched_role(tenants) if tenants else self._get_batch_role(prepared_batch.all_model_ids)
         batch = self._to_training_batch(prepared_batch, role)
+        if tenants:
+            batch["lora_slot"] = torch.tensor(slots, dtype=torch.long)
         micro_bs = (
             self._cfg.trainer.micro_forward_batch_size_per_gpu if self._cfg.trainer.strategy == "megatron" else None
         )
         batch, pad_size = self._pad_batch(batch, micro_batch_size=micro_bs)
         model_id = prepared_batch.all_model_ids[0] if prepared_batch.all_model_ids else None
-        data = self._dispatch.forward(role, batch, model_id=model_id)
+        batched_kwargs = {"lora_tenants": tenants} if tenants else {}
+        data = self._dispatch.forward(role, batch, model_id=model_id, **batched_kwargs)
 
         # Workers emit per-sample loss_fn_outputs directly. Trim padding entries.
         per_sample_outputs = data.loss_fn_outputs

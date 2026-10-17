@@ -669,6 +669,7 @@ class MegatronWorker:
                     # The support scorer validates loss-active targets against captured support.
                     "loss_mask": micro.get("loss_mask") if self.enable_sample_support_replay else None,
                     "sub_seq_lengths": micro.get("sub_seq_lengths"),
+                    "lora_slot": micro.get("lora_slot"),
                     **vlm_inputs,
                 }
             )
@@ -795,6 +796,9 @@ class MegatronWorker:
                 elif key == "response_mask":
                     # response_mask should be zeros for padded samples
                     pad_tensor = torch.zeros((pad_count, *value.shape[1:]), dtype=value.dtype, device=device)
+                elif key == "lora_slot":
+                    # Batched multi-LoRA rows are sorted by slot: pad with the last row's slot.
+                    pad_tensor = value[-1:].expand(pad_count, *value.shape[1:]).clone()
                 else:
                     pad_tensor = torch.zeros((pad_count, *value.shape[1:]), dtype=value.dtype, device=device)
                 padded[key] = torch.cat([value, pad_tensor], dim=0)
@@ -1124,9 +1128,15 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
         return_per_token_outputs: bool = True,
+        lora_tenants: Optional[List[str]] = None,
     ) -> WorkerOutput:
         """
         Perform forward and backward passes for a batch, handling micro-batching internally.
+
+        ``lora_tenants`` (multi-LoRA builds): the batch mixes these tenants' rows,
+        sorted by tenant and tagged with ``lora_slot``; the first is the live
+        adapter, the rest run in scratch slots and get their gradients added to
+        their stored gradients (see workers/megatron/multi_lora.py).
 
         The batch is split into micro batches based on micro_train_batch_size_per_gpu,
         or by token count if max_tokens_per_microbatch is configured.
@@ -1146,6 +1156,13 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` and scalar
             ``metrics`` (all-reduced across DP).
         """
+        tenants = self._begin_batched_lora(lora_tenants)
+        try:
+            return self._forward_backward(data, loss_fn, loss_fn_config, return_per_token_outputs)
+        finally:
+            self._end_batched_lora(tenants, keep_grads=True)
+
+    def _forward_backward(self, data, loss_fn, loss_fn_config, return_per_token_outputs) -> WorkerOutput:
         self.model.train()
         torch.cuda.reset_peak_memory_stats()
 
@@ -1170,11 +1187,17 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         micro_buffer = []
 
         if microbatch_iterator is not None:
-            experiences = (BaseBatchIterator.batch_to_experience(mb) for mb in microbatch_iterator)
+            token_microbatches = list(microbatch_iterator)
+            experiences = [BaseBatchIterator.batch_to_experience(mb) for mb in token_microbatches]
+            lora_slots = [mb.get("lora_slot") for mb in token_microbatches]
         else:
             experiences = BatchIterator(data, self.cfg.micro_train_batch_size_per_gpu, drop_last=False)
+            slot_field = data.get("lora_slot")
+            lora_slots = (
+                list(slot_field.split(self.cfg.micro_train_batch_size_per_gpu)) if slot_field is not None else None
+            )
 
-        for experience in experiences:
+        for mb_index, experience in enumerate(experiences):
             attention_mask = experience.attention_mask
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 0)
@@ -1208,6 +1231,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     "is_padding_batch": (
                         experience.metadata.get("is_padding_batch", False) if experience.metadata else False
                     ),
+                    "lora_slot": lora_slots[mb_index] if lora_slots is not None else None,
                     **vlm_inputs,
                 }
             )
@@ -1860,6 +1884,29 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 except OSError as e:
                     logger.warning(f"Failed to remove lora_sync subdir {lora_sync_path}: {e}")
 
+    def _begin_batched_lora(self, lora_tenants: Optional[List[str]]) -> Optional[List[str]]:
+        """Lend scratch slots to lora_tenants[1:] for one batched pass (None: no batching)."""
+        if not lora_tenants or len(lora_tenants) == 1:
+            return None
+        n_slots = self.cfg.policy.megatron_config.lora_config.multi_lora_slots
+        if len(lora_tenants) > n_slots:
+            raise ValueError(f"{len(lora_tenants)} tenants in one pass but only {n_slots} multi-LoRA slots")
+        if mpu.get_data_parallel_world_size() != 1:
+            # Scratch-slot gradients are not reduced across data-parallel ranks yet.
+            raise NotImplementedError("batched multi-LoRA passes need data_parallel_size == 1")
+        if self.adapter_store.current_id != lora_tenants[0]:
+            raise RuntimeError(
+                f"batched pass expects {lora_tenants[0]} live, found {self.adapter_store.current_id}"
+            )
+        multi_lora.lend_slots(self.actor_module, self.adapter_store, lora_tenants)
+        return lora_tenants
+
+    def _end_batched_lora(self, tenants: Optional[List[str]], keep_grads: bool) -> None:
+        if tenants is None:
+            return
+        multi_lora.clear_explicit_routing(self.actor_module)
+        multi_lora.return_slots(self.actor_module, self.adapter_store, tenants, keep_grads=keep_grads)
+
     def swap_to_adapter(self, model_id: str) -> None:
         """Make ``model_id`` the live adapter on this worker. No-op if it
         already is. Issues local tensor.copy_()s + dp_group barriers.
@@ -1908,14 +1955,18 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
         self.model: MegatronModelWrapper = None
         self.actor_module: List[nn.Module] = None
 
-    def forward(self, data: TrainingInputBatch) -> WorkerOutput:
+    def forward(self, data: TrainingInputBatch, lora_tenants: Optional[List[str]] = None) -> WorkerOutput:
         """Run inference forward pass.
 
         Returns a :class:`WorkerOutput` whose ``loss_fn_outputs`` carries one
         per-sample dict with key ``"logprobs"``. Token-based micro-batching (when
         ``max_tokens_per_microbatch > 0``) is handled inside ``_forward_logprobs``.
         """
-        log_probs = self._forward_logprobs(data)
+        tenants = self._begin_batched_lora(lora_tenants)
+        try:
+            log_probs = self._forward_logprobs(data)
+        finally:
+            self._end_batched_lora(tenants, keep_grads=False)
         loss_fn_outputs = [{"logprobs": log_probs[i].tolist()} for i in range(log_probs.shape[0])]
         return WorkerOutput(loss_fn_outputs=loss_fn_outputs, metrics={})
 

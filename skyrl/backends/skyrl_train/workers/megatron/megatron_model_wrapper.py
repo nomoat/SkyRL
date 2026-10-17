@@ -71,6 +71,7 @@ from skyrl.backends.skyrl_train.utils.sample_support_replay import (
     reject_unsupported_sample_support_packing,
 )
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
+from skyrl.backends.skyrl_train.workers.megatron.multi_lora import route_packed_microbatch
 from skyrl.backends.skyrl_train.workers.worker_utils import (
     compute_minibatch_rollout_logprob_diff_metrics,
 )
@@ -513,6 +514,8 @@ class MegatronModelWrapper:
                     remove_microbatch_padding=self.remove_microbatch_padding,
                 )
 
+            # Batched multi-LoRA: route this micro-batch's rows to their adapter slots.
+            route_packed_microbatch(model, batch, packed_seq_params, new_sequences, sub_seq_lengths)
             with native_mtp_disabled(model):
                 if self._fused_lm_head:
                     # Fused LM-head inference: the output_processor returns decoder
@@ -1206,6 +1209,8 @@ class MegatronModelWrapper:
                     "draft teacher. Disable one of them."
                 )
 
+            # Batched multi-LoRA: route this micro-batch's rows to their adapter slots.
+            route_packed_microbatch(model, batch, packed_seq_params, new_sequences, sub_seq_lengths)
             # Run the policy forward; when MTP is active a pre-hook records the MTP block's arguments.
             student_hidden = None
             student_model = None

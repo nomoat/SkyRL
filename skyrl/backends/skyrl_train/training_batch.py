@@ -668,6 +668,9 @@ def pad_training_input_batch(unpadded_batch: TrainingInputBatch, pad_size: int) 
             additional_dims = tensor.shape[1:]
             padding_tensor = torch.ones(pad_size, *additional_dims, dtype=torch.bool, device=tensor.device)
             new_tensors[key] = torch.cat([tensor, padding_tensor], dim=0)
+        elif key == "lora_slot":
+            # Batched multi-LoRA rows are sorted by slot: pad with the last row's slot.
+            new_tensors[key] = torch.cat([tensor, tensor[-1:].expand(pad_size, *tensor.shape[1:]).clone()], dim=0)
         else:
             # Copy row 0 `pad_size` times. Loss masked so values don't affect the loss. Just need valid shape/dtype.
             assert tensor.shape[0] > 0, f"Cannot pad empty tensor field {key!r}"
