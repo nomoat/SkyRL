@@ -132,6 +132,14 @@ from skyrl.backends.skyrl_train.patches.vllm.patch_glm5next_lora_packing import 
 )
 
 apply_glm5next_lora_packing_patch()
+
+# LoRA on lm_head crashes vLLM when prompt-logprobs requests share a batch with
+# generation; SkyRL never trains lm_head. Must run before the LoRA manager exists.
+from skyrl.backends.skyrl_train.patches.vllm.patch_lora_no_lm_head import (  # noqa: E402
+    apply_lora_no_lm_head_patch,
+)
+
+apply_lora_no_lm_head_patch()
 # Runs in every vLLM worker process before the model is loaded, so the
 # LoRA-capability declaration is in place for the supports_lora() gate.
 from skyrl.backends.skyrl_train.patches.vllm_kimi_k25_lora import (  # noqa: E402
