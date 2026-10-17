@@ -1015,8 +1015,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
         return_per_token_outputs: bool = True,
+        lora_tenants: Optional[List[str]] = None,
     ) -> WorkerOutput:
         """Forward pass.
+
+        ``lora_tenants``: a batched multi-LoRA pass (inference path only), as in
+        :meth:`forward_backward`.
 
         - Without ``loss_fn``: runs Megatron's pipeline inference and returns a
           :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` (``logprobs``
@@ -1034,10 +1038,16 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             # Megatron inference forward path: emit per-sample logprobs. Token-based
             # micro-batching (when `max_tokens_per_microbatch > 0`) is handled inside
             # `_forward_logprobs`, which also reorders back to the original sample order.
-            log_probs = self._forward_logprobs(data)
+            tenants = self._begin_batched_lora(lora_tenants)
+            try:
+                log_probs = self._forward_logprobs(data)
+            finally:
+                self._end_batched_lora(tenants, keep_grads=False)
             loss_fn_outputs = [{"logprobs": log_probs[i].tolist()} for i in range(log_probs.shape[0])]
             return WorkerOutput(loss_fn_outputs=loss_fn_outputs, metrics={})
 
+        if lora_tenants and len(lora_tenants) > 1:
+            raise NotImplementedError("batched multi-LoRA forward passes with a loss function")
         self.model.eval()
 
         micro_batch_size = self.cfg.micro_forward_batch_size_per_gpu
@@ -1955,18 +1965,14 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
         self.model: MegatronModelWrapper = None
         self.actor_module: List[nn.Module] = None
 
-    def forward(self, data: TrainingInputBatch, lora_tenants: Optional[List[str]] = None) -> WorkerOutput:
+    def forward(self, data: TrainingInputBatch) -> WorkerOutput:
         """Run inference forward pass.
 
         Returns a :class:`WorkerOutput` whose ``loss_fn_outputs`` carries one
         per-sample dict with key ``"logprobs"``. Token-based micro-batching (when
         ``max_tokens_per_microbatch > 0``) is handled inside ``_forward_logprobs``.
         """
-        tenants = self._begin_batched_lora(lora_tenants)
-        try:
-            log_probs = self._forward_logprobs(data)
-        finally:
-            self._end_batched_lora(tenants, keep_grads=False)
+        log_probs = self._forward_logprobs(data)
         loss_fn_outputs = [{"logprobs": log_probs[i].tolist()} for i in range(log_probs.shape[0])]
         return WorkerOutput(loss_fn_outputs=loss_fn_outputs, metrics={})
 
